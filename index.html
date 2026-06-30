@@ -159,6 +159,7 @@
             });
 
             const [inputText, setInputText] = useState('');
+            // Режимы: 'ai', 'fast', 'exclude'
             const [processingMode, setProcessingMode] = useState('ai'); 
             const [isLoading, setIsLoading] = useState(false);
             const [candidates, setCandidates] = useState([]); 
@@ -186,7 +187,7 @@
             const [showGhConfig, setShowGhConfig] = useState(false);
             const [isCommitPending, setIsCommitPending] = useState(false);
 
-            // Настройки Gemini (Для внешнего хостинга на GitHub Pages)
+            // Настройки Gemini
             const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('nf_gemini_key') || '');
 
             // ПРЕДОХРАНИТЕЛИ: Важные состояния для защиты от затирания файлов
@@ -199,7 +200,7 @@
                 localStorage.setItem('nounforge_dictionary', JSON.stringify(dictionary));
             }, [dictionary]);
 
-            // Сохранение настроек GitHub и Gemini при изменении
+            // Сохранение настроек GitHub при изменении
             useEffect(() => {
                 localStorage.setItem('nf_gh_token', ghToken);
                 localStorage.setItem('nf_gh_owner', ghOwner);
@@ -211,7 +212,7 @@
                 localStorage.setItem('nf_gemini_key', geminiKey);
             }, [ghToken, ghOwner, ghRepo, ghBranch, ghPath, ghSha, autoCommit, geminiKey]);
 
-            // Автоматический pull из GitHub при старте приложения, если есть настройки и запуск не из локального файла
+            // Автоматический pull из GitHub при старте приложения
             useEffect(() => {
                 if (ghToken.trim() && ghOwner.trim() && ghRepo.trim() && !isLocalFile) {
                     handlePullFromGitHub(true);
@@ -224,7 +225,6 @@
             };
 
             // --- ФУНКЦИИ GITHUB REST API ---
-
             const handlePullFromGitHub = async (quiet = false) => {
                 const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
@@ -517,6 +517,37 @@
 
                 setIsLoading(true);
                 try {
+                    // НОВЫЙ РЕЖИМ: Массовое исключение слов (Стоп-лист)
+                    if (processingMode === 'exclude') {
+                        const rawWords = inputText.match(/[а-яА-ЯёЁ\-]+/g) || [];
+                        const wordsToExclude = [...new Set(rawWords.map(w => w.toLowerCase()))];
+                        
+                        if (wordsToExclude.length === 0) {
+                            showToast("В тексте не найдено слов (кириллицы) для удаления", "warning");
+                            setIsLoading(false);
+                            return;
+                        }
+
+                        setDictionary(prev => {
+                            const initialLength = prev.length;
+                            const updated = prev.filter(w => !wordsToExclude.includes(w));
+                            const removedCount = initialLength - updated.length;
+                            
+                            if (removedCount > 0) {
+                                showToast(`Массовое удаление завершено! Стерто слов: ${removedCount}`, "success");
+                                triggerAutoCommitIfEnabled(updated);
+                            } else {
+                                showToast("Ни одно из введенных слов не найдено в базе словаря", "info");
+                            }
+                            return updated;
+                        });
+                        
+                        setInputText('');
+                        setIsLoading(false);
+                        return; // Завершаем функцию, чтобы не переходить к генерации кандидатов
+                    }
+
+                    // Стандартный парсинг (AI или Fast)
                     let extractedWords = [];
 
                     if (processingMode === 'ai') {
@@ -1132,7 +1163,7 @@
                                 <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 shadow-xl relative">
                                     <div className="flex items-center justify-between mb-4">
                                         <h2 className="text-base font-semibold text-zinc-100 flex items-center space-x-2">
-                                            <span>1. Импорт и извлечение</span>
+                                            <span>1. Операции с текстом</span>
                                         </h2>
                                         
                                         {/* Загрузка исходного файла словаря */}
@@ -1169,41 +1200,58 @@
                                     </div>
 
                                     {/* Селектор режимов */}
-                                    <div className="mt-4 p-1 bg-zinc-950 border border-zinc-800 rounded-xl grid grid-cols-2 text-center text-xs">
+                                    <div className="mt-4 p-1 bg-zinc-950 border border-zinc-800 rounded-xl grid grid-cols-3 gap-1 text-center text-[11px] sm:text-xs">
                                         <button
                                             onClick={() => setProcessingMode('ai')}
                                             className={`py-2 rounded-lg font-medium transition-all flex items-center justify-center space-x-1.5 ${
                                                 processingMode === 'ai' 
                                                     ? 'bg-indigo-600 text-white shadow' 
-                                                    : 'text-zinc-400 hover:text-zinc-200'
+                                                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/50'
                                             }`}
                                         >
-                                            <Sparkles className="w-3.5 h-3.5" />
-                                            <span>AI Лингвист (Умный)</span>
+                                            <Sparkles className="w-3.5 h-3.5 hidden sm:block" />
+                                            <span>AI Лингвист</span>
                                         </button>
                                         <button
                                             onClick={() => setProcessingMode('fast')}
                                             className={`py-2 rounded-lg font-medium transition-all flex items-center justify-center space-x-1.5 ${
                                                 processingMode === 'fast' 
-                                                    ? 'bg-zinc-800 text-zinc-100' 
-                                                    : 'text-zinc-400 hover:text-zinc-200'
+                                                    ? 'bg-zinc-800 text-zinc-100 shadow' 
+                                                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/50'
                                             }`}
                                         >
-                                            <Sliders className="w-3.5 h-3.5" />
-                                            <span>Локальный (Быстрый)</span>
+                                            <Sliders className="w-3.5 h-3.5 hidden sm:block" />
+                                            <span>Быстрый</span>
+                                        </button>
+                                        <button
+                                            onClick={() => setProcessingMode('exclude')}
+                                            className={`py-2 rounded-lg font-medium transition-all flex items-center justify-center space-x-1.5 ${
+                                                processingMode === 'exclude' 
+                                                    ? 'bg-red-950/80 border border-red-900/50 text-red-200 shadow' 
+                                                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/50'
+                                            }`}
+                                        >
+                                            <Trash2 className="w-3.5 h-3.5 hidden sm:block" />
+                                            <span>Исключение</span>
                                         </button>
                                     </div>
 
                                     {/* Пояснения к режимам */}
-                                    <div className="mt-3 text-xs text-zinc-500 flex items-start space-x-1.5 p-2 bg-zinc-950/40 rounded-lg border border-zinc-800/50">
+                                    <div className="mt-3 text-[11px] sm:text-xs text-zinc-500 flex items-start space-x-1.5 p-2 bg-zinc-950/40 rounded-lg border border-zinc-800/50">
                                         <Info className="w-4 h-4 text-zinc-400 flex-shrink-0 mt-0.5" />
-                                        {processingMode === 'ai' ? (
+                                        {processingMode === 'ai' && (
                                             <span>
                                                 <strong>Режим AI</strong>: автоматически извлекает только существительные, фильтрует мусор, преобразует слова в <strong>единственное число именительный падеж</strong>. Требуется интернет и включенный VPN.
                                             </span>
-                                        ) : (
+                                        )}
+                                        {processingMode === 'fast' && (
                                             <span>
                                                 <strong>Локальный режим</strong>: просто очищает текст от пунктуации и делит на слова. Работает мгновенно без интернета. Фильтрует прилагательные и множественное число с помощью базовых правил.
+                                            </span>
+                                        )}
+                                        {processingMode === 'exclude' && (
+                                            <span>
+                                                <strong>Массовое удаление (Стоп-лист)</strong>: все слова, найденные в введенном тексте, будут <strong>мгновенно удалены</strong> из вашего словаря (удобно для массовой чистки).
                                             </span>
                                         )}
                                     </div>
@@ -1212,16 +1260,23 @@
                                     <button
                                         onClick={handleProcessText}
                                         disabled={isLoading}
-                                        className={`w-full mt-4 py-3 px-4 rounded-xl font-semibold text-sm transition-all flex items-center justify-center space-x-2 ${
+                                        className={`w-full mt-4 py-3 px-4 rounded-xl font-semibold text-sm transition-all flex items-center justify-center space-x-2 shadow-lg active:scale-98 ${
                                             isLoading 
-                                                ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed' 
-                                                : 'bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white shadow-lg shadow-indigo-950/40 active:scale-98'
+                                                ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed shadow-none' 
+                                                : processingMode === 'exclude'
+                                                ? 'bg-gradient-to-r from-red-700 to-rose-700 hover:from-red-600 hover:to-rose-600 text-white shadow-red-950/40 border border-red-800/50'
+                                                : 'bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white shadow-indigo-950/40 border border-indigo-500/30'
                                         }`}
                                     >
                                         {isLoading ? (
                                             <>
                                                 <RefreshCw className="w-4 h-4 animate-spin text-zinc-500" />
-                                                <span>Выполняется анализ...</span>
+                                                <span>Обработка...</span>
+                                            </>
+                                        ) : processingMode === 'exclude' ? (
+                                            <>
+                                                <Trash2 className="w-4 h-4" />
+                                                <span>Удалить совпадения из базы</span>
                                             </>
                                         ) : (
                                             <>
@@ -1553,7 +1608,7 @@
                                                             className={`w-9 h-9 text-xs font-semibold rounded-xl border transition-all ${
                                                                 currentPage === pageNumber
                                                                     ? 'bg-indigo-600 border-indigo-500 text-white shadow'
-                                                                    : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:bg-zinc-850 hover:text-zinc-200'
+                                                                    : 'bg-zinc-950 border-zinc-850 text-zinc-400 hover:bg-zinc-850 hover:text-zinc-200'
                                                             }`}
                                                         >
                                                             {pageNumber}
@@ -1564,7 +1619,7 @@
                                                 <button
                                                     onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
                                                     disabled={currentPage === totalPages}
-                                                    className="p-2 rounded-xl bg-zinc-950 border border-zinc-800 hover:bg-zinc-800 disabled:opacity-40 disabled:hover:bg-transparent text-zinc-400 transition-all"
+                                                    className="p-2 rounded-xl bg-zinc-950 border border-zinc-850 hover:bg-zinc-800 disabled:opacity-40 disabled:hover:bg-transparent text-zinc-400 transition-all"
                                                 >
                                                     <ChevronRight className="w-4 h-4" />
                                                 </button>
