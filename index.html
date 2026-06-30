@@ -145,6 +145,9 @@
 
         // --- ГЛАВНЫЙ КОМПОНЕНТ ПРИЛОЖЕНИЯ ---
         function App() {
+            // Определение протокола запуска файла
+            const isLocalFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
+
             // --- Состояния приложения ---
             const [dictionary, setDictionary] = useState(() => {
                 try {
@@ -199,60 +202,67 @@
                 localStorage.setItem('nf_gh_autocommit', autoCommit.toString());
             }, [ghToken, ghOwner, ghRepo, ghBranch, ghPath, ghSha, autoCommit]);
 
-            // Автоматический pull из GitHub при старте приложения, если есть настройки
+            // Автоматический pull из GitHub при старте приложения, если есть настройки и запуск не из локального файла
             useEffect(() => {
-                if (ghToken.trim() && ghOwner.trim() && ghRepo.trim()) {
+                if (ghToken.trim() && ghOwner.trim() && ghRepo.trim() && !isLocalFile) {
                     handlePullFromGitHub(true);
                 }
             }, []);
 
             const showToast = (message, type = 'success') => {
                 setToast({ message, type });
-                setTimeout(() => setToast(null), 5000);
+                setTimeout(() => setToast(null), 7000); // Увеличенный лимит отображения ошибок для удобства чтения
             };
 
-            // --- ФУНКЦИИ GITHUB REST API (С автоматической очисткой данных) ---
+            // --- ФУНКЦИИ GITHUB REST API (С автоматической CORS-очисткой данных) ---
 
             // Загрузка словаря из GitHub
             const handlePullFromGitHub = async (quiet = false) => {
-                // Триммим и санируем все входящие строки от случайных пробелов и некорректных символов
-                const token = ghToken.trim();
+                // Триммим и санируем все входящие строки от случайных пробелов и префиксов
+                const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
                 const repo = ghRepo.trim();
                 const branch = ghBranch.trim();
-                const path = ghPath.trim().replace(/^\//, ''); // Удаляем ведущий слэш, если пользователь его случайно ввел
+                const path = ghPath.trim().replace(/^\/+/, ''); // Исключаем ведущие слэши
 
                 if (!token || !owner || !repo) {
                     if (!quiet) showToast("Заполните настройки интеграции с GitHub (Токен, Владелец, Репозиторий)", "error");
                     return;
                 }
 
+                if (isLocalFile) {
+                    showToast("Не удалось выполнить запрос: браузер блокирует исходящие API-запросы с локальных файлов (file://). Пожалуйста, опубликуйте проект на GitHub Pages или запустите локальный сервер.", "error");
+                    return;
+                }
+
                 setGhStatus('loading');
-                const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
+                
+                // Используем кэш-бастинг через GET параметр, убрав Cache-Control заголовок во избежание OPTIONS CORS-блокировок
+                const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}&_t=${Date.now()}`;
 
                 try {
                     const response = await fetch(url, {
                         method: 'GET',
                         headers: {
-                            'Authorization': `Bearer ${token}`, // Используем современный стандарт Bearer
-                            'Accept': 'application/vnd.github.v3+json',
-                            'Cache-Control': 'no-cache'
+                            'Authorization': `token ${token}`, // Префикс classic-токенов 'token'
+                            'Accept': 'application/vnd.github.v3+json'
                         }
                     });
 
                     if (response.status === 404) {
                         setGhStatus('connected');
                         setGhSha('');
-                        if (!quiet) showToast("Файл еще не создан на GitHub. Он появится после первого коммита.", "info");
+                        if (!quiet) showToast("Файл еще не создан в вашем репозитории на GitHub. Он создастся автоматически при первом коммите.", "info");
                         return;
                     }
 
                     if (!response.ok) {
-                        // Обработка статус-кодов ошибок GitHub API
                         if (response.status === 401) {
-                            throw new Error("Неверный токен доступа (401 Unauthorized). Проверьте токен в настройках.");
+                            throw new Error("Неверный токен доступа (401 Unauthorized). Убедитесь, что токен скопирован верно и имеет права 'repo'.");
                         } else if (response.status === 403) {
-                            throw new Error("Доступ заблокирован (403 Forbidden). Возможно, превышен лимит или у токена нет прав 'repo'.");
+                            throw new Error("Доступ заблокирован (403 Forbidden). Возможно, превышен лимит запросов или токен отозван.");
+                        } else if (response.status === 404) {
+                            throw new Error("Репозиторий не найден (404). Проверьте правильность написания имени владельца и названия репозитория.");
                         } else {
                             throw new Error(`Код ошибки сервера: ${response.status}`);
                         }
@@ -281,7 +291,7 @@
                     if (!quiet) {
                         let userFriendlyMessage = error.message;
                         if (userFriendlyMessage.includes("Failed to fetch")) {
-                            userFriendlyMessage = "Ошибка сети (Failed to fetch). Проверьте: 1) Наличие VPN; 2) Не блокирует ли запросы AdBlock / Brave Shield; 3) Правильность юзернейма и имени репозитория.";
+                            userFriendlyMessage = "Сетевая ошибка (Failed to fetch). Возможные причины: 1) У вас включен агрессивный AdBlock/Brave Shields, блокирующий запросы к api.github.com; 2) Работает некорректно настроенный VPN; 3) Ошибка в имени владельца или репозитория.";
                         }
                         showToast(userFriendlyMessage, "error");
                     }
@@ -291,14 +301,19 @@
             // Коммит и пуш словаря в GitHub
             const handlePushToGitHub = async (forcedDictionary = null) => {
                 const dictToSave = forcedDictionary || dictionary;
-                const token = ghToken.trim();
+                const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
                 const repo = ghRepo.trim();
                 const branch = ghBranch.trim();
-                const path = ghPath.trim().replace(/^\//, '');
+                const path = ghPath.trim().replace(/^\/+/, '');
 
                 if (!token || !owner || !repo) {
-                    showToast("Заполните настройки интеграции с GitHub", "error");
+                    showToast("Заполните настройки интеграции с GitHub для отправки коммита", "error");
+                    return;
+                }
+
+                if (isLocalFile) {
+                    showToast("Запись невозможна: браузер блокирует отправку данных на сторонние сервера при просмотре локального HTML-файла (file://). Используйте GitHub Pages.", "error");
                     return;
                 }
 
@@ -313,13 +328,12 @@
                 try {
                     let currentSha = ghSha;
                     
-                    // Шаг 1: Запрашиваем самый свежий SHA-хеш файла, чтобы избежать конфликтов изменений (Conflict 409)
-                    const getResponse = await fetch(`${url}?ref=${branch}`, {
+                    // Запрашиваем актуальный SHA перед отправкой коммита (избегаем рассинхронизаций 409 Conflict)
+                    const getResponse = await fetch(`${url}?ref=${branch}&_t=${Date.now()}`, {
                         method: 'GET',
                         headers: {
-                            'Authorization': `Bearer ${token}`,
-                            'Accept': 'application/vnd.github.v3+json',
-                            'Cache-Control': 'no-cache'
+                            'Authorization': `token ${token}`,
+                            'Accept': 'application/vnd.github.v3+json'
                         }
                     });
 
@@ -329,7 +343,6 @@
                         setGhSha(currentSha);
                     }
 
-                    // Шаг 2: Отправляем коммит
                     const bodyPayload = {
                         message: "NounForge: update dictionary [skip ci]",
                         content: base64Content,
@@ -343,7 +356,7 @@
                     const putResponse = await fetch(url, {
                         method: 'PUT',
                         headers: {
-                            'Authorization': `Bearer ${token}`,
+                            'Authorization': `token ${token}`,
                             'Content-Type': 'application/json',
                             'Accept': 'application/vnd.github.v3+json'
                         },
@@ -358,13 +371,13 @@
                     const putData = await putResponse.json();
                     setGhSha(putData.content.sha);
                     setGhStatus('connected');
-                    showToast("Изменения успешно закомичены в репозиторий GitHub!", "success");
+                    showToast("Изменения успешно сохранены и закомичены в ваш репозиторий GitHub!", "success");
                 } catch (error) {
                     console.error("GitHub Push Error:", error);
                     setGhStatus('error');
                     let userFriendlyMessage = error.message;
                     if (userFriendlyMessage.includes("Failed to fetch")) {
-                        userFriendlyMessage = "Ошибка отправки в сеть. Возможно, ваш браузер или AdBlock блокирует PUT-запросы к GitHub. Проверьте VPN и блокировщики.";
+                        userFriendlyMessage = "Ошибка сети при коммите. Браузер или брандмауэр прервал PUT-запрос к API GitHub. Пожалуйста, отключите блокировщики рекламы или VPN.";
                     }
                     showToast(userFriendlyMessage, "error");
                 } finally {
@@ -788,6 +801,19 @@
                     {showGhConfig && (
                         <div className="bg-zinc-900 border-b border-zinc-800 p-6">
                             <div className="max-w-4xl mx-auto space-y-6">
+                                
+                                {/* ПРЕДУПРЕЖДЕНИЕ О ФАЙЛОВОМ ПРОТОКОЛЕ (CORS WARNING) */}
+                                {isLocalFile && (
+                                    <div className="p-4 bg-red-950/40 border border-red-900/50 rounded-2xl flex items-start space-x-3">
+                                        <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+                                        <div className="text-xs text-red-200 leading-relaxed">
+                                            <strong className="block font-semibold text-red-300 mb-0.5">⚠️ Внимание! Вы запустили файл локально (file://)</strong>
+                                            Браузеры блокируют любые защищенные исходящие API-запросы к GitHub с локально открытых файлов из-за CORS ограничений. 
+                                            Для полноценной работы синхронизации, пожалуйста, опубликуйте этот репозиторий на <strong>GitHub Pages</strong> или запустите проект через локальный веб-сервер (например, плагин <code className="bg-zinc-950 px-1 py-0.5 rounded text-red-400 font-mono">Live Server</code> в VS Code).
+                                        </div>
+                                    </div>
+                                )}
+
                                 <div className="flex items-center justify-between">
                                     <div className="flex items-center space-x-2">
                                         <Github className="w-5 h-5 text-indigo-400" />
@@ -1398,7 +1424,7 @@
                                                             className={`w-9 h-9 text-xs font-semibold rounded-xl border transition-all ${
                                                                 currentPage === pageNumber
                                                                     ? 'bg-indigo-600 border-indigo-500 text-white shadow'
-                                                                    : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:bg-zinc-850 hover:text-zinc-200'
+                                                                    : 'bg-zinc-950 border-zinc-850 text-zinc-400 hover:bg-zinc-850 hover:text-zinc-200'
                                                             }`}
                                                         >
                                                             {pageNumber}
