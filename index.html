@@ -216,12 +216,12 @@
 
             const showToast = (message, type = 'success') => {
                 setToast({ message, type });
-                setTimeout(() => setToast(null), 8000); // Увеличенный лимит отображения ошибок для удобства чтения
+                setTimeout(() => setToast(null), 8000); 
             };
 
-            // --- ФУНКЦИИ GITHUB REST API (С автоматической CORS-очисткой данных) ---
+            // --- ФУНКЦИИ GITHUB REST API ---
 
-            // Загрузка словаря из GitHub
+            // Загрузка словаря из GitHub (Исправленный, CORS-совместимый двухэтапный метод)
             const handlePullFromGitHub = async (quiet = false) => {
                 const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
@@ -235,20 +235,17 @@
                 }
 
                 if (isLocalFile) {
-                    showToast("Не удалось выполнить запрос: браузер блокирует запросы с локальных файлов.", "error");
+                    showToast("Не удалось выполнить запрос: браузер блокирует CORS-запросы с локальных файлов.", "error");
                     return;
                 }
 
                 setGhStatus('loading');
                 
-                // 1. Метаданные получаем через стандартный API (для SHA и размера)
+                // Шаг 1: Читаем метаданные файла через стандартный REST API (полная поддержка CORS и авторизации)
                 const metaUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}&_t=${Date.now()}`;
-                // 2. САМЫЙ ВАЖНЫЙ ШАГ: Само содержимое качаем через RAW API. Оно обходит лимит в 1 МБ и скачивает файлы любого размера без сбоев!
-                const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}?_t=${Date.now()}`;
 
                 try {
-                    // Запрос метаданных
-                    const metaResponse = await fetch(metaUrl, {
+                    const response = await fetch(metaUrl, {
                         method: 'GET',
                         headers: {
                             'Authorization': `token ${token}`,
@@ -256,38 +253,49 @@
                         }
                     });
 
-                    if (metaResponse.status === 404) {
+                    if (response.status === 404) {
                         setGhStatus('connected');
                         setGhSha('');
                         setGithubWordsCount(0);
-                        setIsSyncedWithGitHub(true); // Новый файл/репо считается синхронизированным
+                        setIsSyncedWithGitHub(true); 
                         if (!quiet) showToast("Файл еще не создан в вашем репозитории на GitHub. Синхронизация установлена.", "info");
                         return;
                     }
 
-                    if (!metaResponse.ok) {
-                        if (metaResponse.status === 401) throw new Error("Неверный токен доступа (401 Unauthorized). Проверьте токен.");
-                        if (metaResponse.status === 404) throw new Error("Репозиторий или файл не найдены (404).");
-                        throw new Error(`Ошибка метаданных API: ${metaResponse.status}`);
+                    if (!response.ok) {
+                        if (response.status === 401) throw new Error("Неверный токен доступа (401 Unauthorized). Проверьте токен.");
+                        if (response.status === 404) throw new Error("Репозиторий или файл не найдены (404).");
+                        throw new Error(`Ошибка метаданных API: ${response.status}`);
                     }
 
                     const metaData = await metaResponse.json();
-                    const currentSha = metaData.sha;
-                    setGhSha(currentSha);
+                    setGhSha(metaData.sha);
 
-                    // Запрос plain text содержимого через RAW
-                    const rawResponse = await fetch(rawUrl, {
-                        method: 'GET',
-                        headers: {
-                            'Authorization': `token ${token}`
+                    let decodedContent = "";
+
+                    // Шаг 2: Умное скачивание контента
+                    if (metaData.size < 1000000 && metaData.content) {
+                        // Если файл маленький (<1MB), скачиваем его напрямую из метаданных (он уже там в Base64)
+                        decodedContent = decodeBase64UTF8(metaData.content);
+                    } else {
+                        // Если файл большой (>1MB, например, ваш словарь на 101k слов), скачиваем его blob-объект по его SHA.
+                        // Этот эндпоинт находится на api.github.com, безупречно поддерживает CORS, авторизацию и файлы до 100MB!
+                        const blobUrl = `https://api.github.com/repos/${owner}/${repo}/git/blobs/${metaData.sha}`;
+                        const blobResponse = await fetch(blobUrl, {
+                            method: 'GET',
+                            headers: {
+                                'Authorization': `token ${token}`,
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
+                        });
+
+                        if (!blobResponse.ok) {
+                            throw new Error(`Ошибка загрузки контента большого файла: ${blobResponse.status}`);
                         }
-                    });
 
-                    if (!rawResponse.ok) {
-                        throw new Error(`Ошибка загрузки содержимого Raw-файла: ${rawResponse.status}`);
+                        const blobData = await blobResponse.json();
+                        decodedContent = decodeBase64UTF8(blobData.content);
                     }
-
-                    const decodedContent = await rawResponse.text();
                     
                     const words = decodedContent
                         .split(/[\r\n]+/)
@@ -295,11 +303,11 @@
                         .filter(w => w && /^[а-яё\-]+$/.test(w));
 
                     setGithubWordsCount(words.length);
-                    setIsSyncedWithGitHub(true); // СНЯТ ПРЕДОХРАНИТЕЛЬ: Теперь база актуальна!
+                    setIsSyncedWithGitHub(true); 
                     setGhStatus('connected');
 
                     setDictionary(prev => {
-                        // Если локально открыт дефолтный список (30 слов), полностью стираем его и ставим серверный (100к+ слов)
+                        // Замещаем дефолтные 30 слов на реальный словарь из репозитория
                         const isDemoOnly = prev.every(w => INITIAL_DEMO_NOUNS.includes(w)) && prev.length <= INITIAL_DEMO_NOUNS.length;
                         const baseList = isDemoOnly ? [] : prev;
                         const merged = [...new Set([...baseList, ...words])].sort((a, b) => a.localeCompare(b, 'ru'));
@@ -310,11 +318,11 @@
                 } catch (error) {
                     console.error("GitHub Pull Error:", error);
                     setGhStatus('error');
-                    setIsSyncedWithGitHub(false); // Запрещаем автокоммиты до успешного Pull
+                    setIsSyncedWithGitHub(false); 
                     if (!quiet) {
                         let userFriendlyMessage = error.message;
                         if (userFriendlyMessage.includes("Failed to fetch")) {
-                            userFriendlyMessage = "Ошибка CORS/Сети (Failed to fetch). Возможно, запросы блокируются вашим VPN, AdBlock или Brave Shield.";
+                            userFriendlyMessage = "Ошибка CORS/Сети (Failed to fetch). Возможные причины: 1) Включен блокировщик рекламы AdBlock/Brave Shields; 2) Работает VPN; 3) Опечатка в полях Owner или Repo.";
                         }
                         showToast(userFriendlyMessage, "error");
                     }
@@ -406,9 +414,9 @@
                     const putData = await putResponse.json();
                     setGhSha(putData.content.sha);
                     setGithubWordsCount(sortedDict.length);
-                    setIsSyncedWithGitHub(true); // Уверенная синхронизация
+                    setIsSyncedWithGitHub(true); 
                     setGhStatus('connected');
-                    showToast("Изменения успешно закомичены в ваш репозиторий GitHub!", "success");
+                    showToast("Изменения успешно сохранены и закомичены в ваш репозиторий GitHub!", "success");
                 } catch (error) {
                     console.error("GitHub Push Error:", error);
                     setGhStatus('error');
@@ -422,7 +430,6 @@
                 }
             };
 
-            // Триггер автокоммита (Проводит проверку на синхронизацию с репозиторием)
             const triggerAutoCommitIfEnabled = (updatedDict) => {
                 if (autoCommit && ghToken.trim() && ghOwner.trim() && ghRepo.trim()) {
                     if (!isSyncedWithGitHub) {
@@ -449,7 +456,7 @@
    - Все остальные части речи: глаголы, прилагательные, местоимения, предлоги, союзы, междометия, причастия, деепричастия, числительные.
 4. Оставь только нарицательные неодушевленные и одушевленные существительные в единственном числе именительном падеже.
 5. Верни результат СТРОГО в формате JSON с корневым ключом "nouns", содержащим плоский массив строк в нижнем регистре. Не используй markdown-разметку \`\`\`json вокруг JSON-ответа, верни чистую строку JSON.
-Пример ответа: { "nouns": ["автомобиль", "книга", "яблоко"] }`;
+Пример ответа: { "nouns": ["автомоль", "книга", "яблоко"] }`;
 
                 const payload = {
                     contents: [{ parts: [{ text }] }],
@@ -1009,7 +1016,7 @@
                                 <div className="text-xs text-amber-200 leading-relaxed">
                                     <strong className="block font-semibold text-amber-300 mb-0.5">⚠️ Внимание: Требуется синхронизация репозитория</strong>
                                     Вы настроили связь с репозиторием GitHub, но локальная копия приложения еще не синхронизирована с файлом на сервере. Во избежание случайного затирания удаленных данных, 
-                                    пожалуйста, нажмите кнопку <button onClick={() => handlePullFromGitHub(false)} className="underline hover:text-white font-bold">Загрузить (Pull)</button> перед началом любой работы.
+                                    пожалуйста, нажмите кнопку <button onClick={() => handlePullFromGitHub(false)} className="underline hover:text-white font-bold font-mono">Загрузить (Pull)</button> перед началом любой работы.
                                 </div>
                             </div>
                         )}
@@ -1460,7 +1467,7 @@
                                                 <button
                                                     onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
                                                     disabled={currentPage === 1}
-                                                    className="p-2 rounded-xl bg-zinc-950 border border-zinc-800 hover:bg-zinc-800 disabled:opacity-40 disabled:hover:bg-transparent text-zinc-400 transition-all"
+                                                    className="p-2 rounded-xl bg-zinc-950 border border-zinc-850 hover:bg-zinc-800 disabled:opacity-40 disabled:hover:bg-transparent text-zinc-400 transition-all"
                                                 >
                                                     <ChevronLeft className="w-4 h-4" />
                                                 </button>
