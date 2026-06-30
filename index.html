@@ -199,7 +199,7 @@
                 localStorage.setItem('nounforge_dictionary', JSON.stringify(dictionary));
             }, [dictionary]);
 
-            // Сохранение настроек GitHub при изменении
+            // Сохранение настроек GitHub и Gemini при изменении
             useEffect(() => {
                 localStorage.setItem('nf_gh_token', ghToken);
                 localStorage.setItem('nf_gh_owner', ghOwner);
@@ -225,13 +225,12 @@
 
             // --- ФУНКЦИИ GITHUB REST API ---
 
-            // Загрузка словаря из GitHub (Исправленный, CORS-совместимый двухэтапный метод)
             const handlePullFromGitHub = async (quiet = false) => {
                 const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
                 const repo = ghRepo.trim();
                 const branch = ghBranch.trim();
-                const path = ghPath.trim().replace(/^\/+/, ''); // Исключаем ведущие слэши
+                const path = ghPath.trim().replace(/^\/+/, ''); 
 
                 if (!token || !owner || !repo) {
                     if (!quiet) showToast("Заполните настройки интеграции с GitHub (Токен, Владелец, Репозиторий)", "error");
@@ -245,7 +244,6 @@
 
                 setGhStatus('loading');
                 
-                // Шаг 1: Читаем метаданные файла через стандартный REST API (полная поддержка CORS и авторизации)
                 const metaUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}&_t=${Date.now()}`;
 
                 try {
@@ -277,13 +275,9 @@
 
                     let decodedContent = "";
 
-                    // Шаг 2: Умное скачивание контента
                     if (metaData.size < 1000000 && metaData.content) {
-                        // Если файл маленький (<1MB), скачиваем его напрямую из метаданных (он уже там в Base64)
                         decodedContent = decodeBase64UTF8(metaData.content);
                     } else {
-                        // Если файл большой (>1MB, например, ваш словарь на 101k слов), скачиваем его blob-объект по его SHA.
-                        // Этот эндпоинт находится на api.github.com, безупречно поддерживает CORS, авторизацию и файлы до 100MB!
                         const blobUrl = `https://api.github.com/repos/${owner}/${repo}/git/blobs/${metaData.sha}`;
                         const blobResponse = await fetch(blobUrl, {
                             method: 'GET',
@@ -311,7 +305,6 @@
                     setGhStatus('connected');
 
                     setDictionary(prev => {
-                        // Замещаем дефолтные 30 слов на реальный словарь из репозитория
                         const isDemoOnly = prev.every(w => INITIAL_DEMO_NOUNS.includes(w)) && prev.length <= INITIAL_DEMO_NOUNS.length;
                         const baseList = isDemoOnly ? [] : prev;
                         const merged = [...new Set([...baseList, ...words])].sort((a, b) => a.localeCompare(b, 'ru'));
@@ -333,7 +326,6 @@
                 }
             };
 
-            // Коммит и пуш словаря в GitHub (с защитой от затирания)
             const handlePushToGitHub = async (forcedDictionary = null, isForcedOverride = false) => {
                 const dictToSave = forcedDictionary || dictionary;
                 const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
@@ -352,13 +344,11 @@
                     return;
                 }
 
-                // ПРЕДОХРАНИТЕЛЬ 1: Защита от случайного Push, если еще ни разу не делали Pull
                 if (!isSyncedWithGitHub && !isForcedOverride && ghSha) {
                     setShowOverOverWriteModal(true);
                     return;
                 }
 
-                // ПРЕДОХРАНИТЕЛЬ 2: Защита от затирания большого объема маленьким объемом локальных данных
                 if (githubWordsCount !== null && githubWordsCount > dictToSave.length + 50 && !isForcedOverride) {
                     setShowOverOverWriteModal(true);
                     return;
@@ -375,7 +365,6 @@
                 try {
                     let currentSha = ghSha;
                     
-                    // Запрашиваем свежий SHA
                     const getResponse = await fetch(`${url}?ref=${branch}&_t=${Date.now()}`, {
                         method: 'GET',
                         headers: {
@@ -446,9 +435,9 @@
             };
 
             // --- ЭКСПОНЕНЦИАЛЬНЫЙ БЭК-ОФФ ДЛЯ GEMINI ---
-            const extractNounsWithGemini = async (text, retries = 5, delay = 1000) => {
-                const apiKey = geminiKey.trim() || ""; // Используем ключ пользователя
-                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            const extractNounsWithGemini = async (text, retries = 3, delay = 1000) => {
+                const apiKey = geminiKey.trim() || ""; 
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
                 
                 const systemPrompt = `Ты — профессиональный лингвистический экстрактор и лемматизатор русского языка. Твоя задача — проанализировать предоставленный русский текст и извлечь из него ВСЕ имена существительные. 
 Для каждого найденного существительного строго соблюдай следующие требования:
@@ -460,7 +449,7 @@
    - Все остальные части речи: глаголы, прилагательные, местоимения, предлоги, союзы, междометия, причастия, деепричастия, числительные.
 4. Оставь только нарицательные неодушевленные и одушевленные существительные в единственном числе именительном падеже.
 5. Верни результат СТРОГО в формате JSON с корневым ключом "nouns", содержащим плоский массив строк в нижнем регистре. Не используй markdown-разметку \`\`\`json вокруг JSON-ответа, верни чистую строку JSON.
-Пример ответа: { "nouns": ["автомоль", "книга", "яблоко"] }`;
+Пример ответа: { "nouns": ["автомобиль", "книга", "яблоко"] }`;
 
                 const payload = {
                     contents: [{ parts: [{ text }] }],
@@ -505,7 +494,10 @@
                         throw new Error("Не удалось разобрать структуру ответа Gemini");
                     } catch (error) {
                         if (error.message.includes("403") || error.message.includes("400")) {
-                            throw new Error("Код 403. Отсутствует API-ключ Gemini. Укажите его в настройках (Связь с GitHub).");
+                            throw new Error("Неверный API-ключ Gemini (Код 403). Проверьте ключ в настройках.");
+                        }
+                        if (error.message.includes("Failed to fetch") || error.name === "TypeError") {
+                            throw new Error("Ошибка сети: Google API заблокирован в РФ. Пожалуйста, ВКЛЮЧИТЕ VPN для работы умного режима AI!");
                         }
                         if (attempt === retries) {
                             throw error;
@@ -530,8 +522,8 @@
                     if (processingMode === 'ai') {
                         extractedWords = await extractNounsWithGemini(inputText);
                     } else {
-                        // Жесткий локальный фильтр от мусора (исключает слова с дефисами и частые окончания прилагательных/глаголов)
-                        const rawWords = inputText.match(/[а-яА-ЯёЁ]+/g) || []; // Исключили дефис из регулярки
+                        // Локальный режим: исключили дефисы из регулярного выражения
+                        const rawWords = inputText.match(/[а-яА-ЯёЁ]+/g) || [];
                         const stopWords = new Set(["я", "ты", "он", "она", "оно", "мы", "вы", "они", "меня", "тебя", "себя", "его", "ее", "их", "нам", "вам", "им", "мной", "тобой", "собой", "мой", "твой", "свой", "наш", "ваш", "этот", "тот", "такой", "какой", "чей", "кто", "что", "весь", "всякий", "сам", "самый", "как", "так", "где", "там", "тут", "здесь", "куда", "туда", "откуда", "оттуда", "когда", "тогда", "почему", "потому", "зачем", "затем", "в", "на", "с", "к", "по", "из", "у", "от", "для", "за", "над", "под", "до", "при", "об", "про", "о", "без", "ради", "через", "между", "перед", "около", "возле", "вдоль", "вместо", "внутри", "вне", "кроме", "сквозь", "среди", "и", "а", "но", "да", "или", "либо", "ни", "тоже", "также", "чтобы", "чтоб", "если", "хотя", "хоть", "пусть", "раз", "ведь", "даже", "уже", "ли", "ль", "же", "ж", "бы", "б", "только", "лишь", "вот", "вон", "ну", "не", "нет"]);
                         const safeNouns = ["гений", "санаторий", "пролетарий", "сценарий", "комментарий", "алюминий", "жребий", "рабочий", "ученый", "мороженое", "животное", "запятая", "кино", "пальто", "кофе", "меню", "такси", "жюри", "радио", "шоссе", "сало", "дело", "тело", "лето", "чудо", "дно", "вино", "окно", "пятно", "зерно", "яблоко", "облако", "колесо", "солнце", "лицо", "сердце", "яйцо", "кольцо", "число", "письмо", "весло", "стекло", "кресло", "время", "бремя", "племя", "имя", "пламя", "знамя"];
 
@@ -544,8 +536,16 @@
                             const isAdjective = /(ая|яя|ое|ее|ый|ий|ой|ые|ие|ого|его|ому|ему|ым|им|ую|юю|ою|ею|вши|вший|вшая|вшее|вшие)$/.test(w);
                             const isVerb = /(ть|ти|чь|л|ла|ло|ли|ешь|ет|ем|ете|ут|ют|ишь|ит|им|ите|ат|ят|ся|сь|в|вши|вше|учи|ючи)$/.test(w);
                             
-                            return !isAdjective && !isVerb;
+                            // Жесткий отсев явных множественных косвенных падежей
+                            const isObliquePlural = w.length > 4 && /(ами|ями|ах|ях)$/.test(w);
+                            
+                            return !isAdjective && !isVerb && !isObliquePlural;
                         });
+
+                        // Предупреждение пользователю о работе локального алгоритма
+                        if (extractedWords.length > 5) {
+                            showToast("Внимание: Локальный режим лишь отсеивает мусор. Для преобразования слов в Именительный падеж используйте AI-режим с включенным VPN.", "warning");
+                        }
                     }
 
                     if (extractedWords.length === 0) {
@@ -933,7 +933,7 @@
                                                 className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500 font-mono text-indigo-300"
                                             />
                                             <p className="text-[10px] text-zinc-500 mt-1">
-                                                Создайте токен GitHub в настройках вашего профиля с правами (scope) <code className="text-zinc-400 font-mono">repo</code>.
+                                                Создайте токен GitHub в настройках профиля с правами (scope) <code className="text-zinc-400 font-mono">repo</code>.
                                             </p>
                                         </div>
 
@@ -1186,11 +1186,11 @@
                                         <Info className="w-4 h-4 text-zinc-400 flex-shrink-0 mt-0.5" />
                                         {processingMode === 'ai' ? (
                                             <span>
-                                                <strong>Режим AI</strong>: автоматически извлекает только существительные, фильтрует мусор, преобразует слова в <strong>единственное число именительный падеж</strong>. Требуется интернет.
+                                                <strong>Режим AI</strong>: автоматически извлекает только существительные, фильтрует мусор, преобразует слова в <strong>единственное число именительный падеж</strong>. Требуется интернет и включенный VPN.
                                             </span>
                                         ) : (
                                             <span>
-                                                <strong>Локальный режим</strong>: просто очищает текст от пунктуации и делит на отдельные слова. Предполагает, что слова уже подготовлены в нужной словарной форме. Работает мгновенно без интернета.
+                                                <strong>Локальный режим</strong>: просто очищает текст от пунктуации и делит на слова. Работает мгновенно без интернета. Фильтрует прилагательные и множественное число с помощью базовых правил.
                                             </span>
                                         )}
                                     </div>
