@@ -201,33 +201,40 @@
 
             // Автоматический pull из GitHub при старте приложения, если есть настройки
             useEffect(() => {
-                if (ghToken && ghOwner && ghRepo) {
+                if (ghToken.trim() && ghOwner.trim() && ghRepo.trim()) {
                     handlePullFromGitHub(true);
                 }
             }, []);
 
             const showToast = (message, type = 'success') => {
                 setToast({ message, type });
-                setTimeout(() => setToast(null), 4000);
+                setTimeout(() => setToast(null), 5000);
             };
 
-            // --- ФУНКЦИИ GITHUB REST API ---
+            // --- ФУНКЦИИ GITHUB REST API (С автоматической очисткой данных) ---
 
             // Загрузка словаря из GitHub
             const handlePullFromGitHub = async (quiet = false) => {
-                if (!ghToken || !ghOwner || !ghRepo) {
-                    if (!quiet) showToast("Заполните настройки интеграции с GitHub", "error");
+                // Триммим и санируем все входящие строки от случайных пробелов и некорректных символов
+                const token = ghToken.trim();
+                const owner = ghOwner.trim();
+                const repo = ghRepo.trim();
+                const branch = ghBranch.trim();
+                const path = ghPath.trim().replace(/^\//, ''); // Удаляем ведущий слэш, если пользователь его случайно ввел
+
+                if (!token || !owner || !repo) {
+                    if (!quiet) showToast("Заполните настройки интеграции с GitHub (Токен, Владелец, Репозиторий)", "error");
                     return;
                 }
 
                 setGhStatus('loading');
-                const url = `https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${ghPath}?ref=${ghBranch}`;
+                const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
 
                 try {
                     const response = await fetch(url, {
                         method: 'GET',
                         headers: {
-                            'Authorization': `token ${ghToken}`,
+                            'Authorization': `Bearer ${token}`, // Используем современный стандарт Bearer
                             'Accept': 'application/vnd.github.v3+json',
                             'Cache-Control': 'no-cache'
                         }
@@ -241,7 +248,14 @@
                     }
 
                     if (!response.ok) {
-                        throw new Error(`Код ошибки: ${response.status}`);
+                        // Обработка статус-кодов ошибок GitHub API
+                        if (response.status === 401) {
+                            throw new Error("Неверный токен доступа (401 Unauthorized). Проверьте токен в настройках.");
+                        } else if (response.status === 403) {
+                            throw new Error("Доступ заблокирован (403 Forbidden). Возможно, превышен лимит или у токена нет прав 'repo'.");
+                        } else {
+                            throw new Error(`Код ошибки сервера: ${response.status}`);
+                        }
                     }
 
                     const data = await response.json();
@@ -262,16 +276,28 @@
 
                     if (!quiet) showToast(`Успешно загружено и объединено слов с GitHub: ${words.length}`, "success");
                 } catch (error) {
-                    console.error(error);
+                    console.error("GitHub Pull Error:", error);
                     setGhStatus('error');
-                    if (!quiet) showToast(`Ошибка GitHub Pull: ${error.message}`, "error");
+                    if (!quiet) {
+                        let userFriendlyMessage = error.message;
+                        if (userFriendlyMessage.includes("Failed to fetch")) {
+                            userFriendlyMessage = "Ошибка сети (Failed to fetch). Проверьте: 1) Наличие VPN; 2) Не блокирует ли запросы AdBlock / Brave Shield; 3) Правильность юзернейма и имени репозитория.";
+                        }
+                        showToast(userFriendlyMessage, "error");
+                    }
                 }
             };
 
             // Коммит и пуш словаря в GitHub
             const handlePushToGitHub = async (forcedDictionary = null) => {
                 const dictToSave = forcedDictionary || dictionary;
-                if (!ghToken || !ghOwner || !ghRepo) {
+                const token = ghToken.trim();
+                const owner = ghOwner.trim();
+                const repo = ghRepo.trim();
+                const branch = ghBranch.trim();
+                const path = ghPath.trim().replace(/^\//, '');
+
+                if (!token || !owner || !repo) {
                     showToast("Заполните настройки интеграции с GitHub", "error");
                     return;
                 }
@@ -279,17 +305,19 @@
                 setIsCommitPending(true);
                 setGhStatus('syncing');
 
-                const url = `https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${ghPath}`;
+                const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
                 const sortedDict = [...dictToSave].sort((a, b) => a.localeCompare(b, 'ru'));
                 const fileContent = sortedDict.join('\n'); 
                 const base64Content = encodeBase64UTF8(fileContent);
 
                 try {
                     let currentSha = ghSha;
-                    const getResponse = await fetch(`${url}?ref=${ghBranch}`, {
+                    
+                    // Шаг 1: Запрашиваем самый свежий SHA-хеш файла, чтобы избежать конфликтов изменений (Conflict 409)
+                    const getResponse = await fetch(`${url}?ref=${branch}`, {
                         method: 'GET',
                         headers: {
-                            'Authorization': `token ${ghToken}`,
+                            'Authorization': `Bearer ${token}`,
                             'Accept': 'application/vnd.github.v3+json',
                             'Cache-Control': 'no-cache'
                         }
@@ -301,10 +329,11 @@
                         setGhSha(currentSha);
                     }
 
+                    // Шаг 2: Отправляем коммит
                     const bodyPayload = {
                         message: "NounForge: update dictionary [skip ci]",
                         content: base64Content,
-                        branch: ghBranch
+                        branch: branch
                     };
 
                     if (currentSha) {
@@ -314,7 +343,7 @@
                     const putResponse = await fetch(url, {
                         method: 'PUT',
                         headers: {
-                            'Authorization': `token ${ghToken}`,
+                            'Authorization': `Bearer ${token}`,
                             'Content-Type': 'application/json',
                             'Accept': 'application/vnd.github.v3+json'
                         },
@@ -323,7 +352,7 @@
 
                     if (!putResponse.ok) {
                         const errorData = await putResponse.json();
-                        throw new Error(errorData.message || `Код ошибки: ${putResponse.status}`);
+                        throw new Error(errorData.message || `Код ошибки сервера: ${putResponse.status}`);
                     }
 
                     const putData = await putResponse.json();
@@ -331,16 +360,20 @@
                     setGhStatus('connected');
                     showToast("Изменения успешно закомичены в репозиторий GitHub!", "success");
                 } catch (error) {
-                    console.error(error);
+                    console.error("GitHub Push Error:", error);
                     setGhStatus('error');
-                    showToast(`Ошибка GitHub Push: ${error.message}`, "error");
+                    let userFriendlyMessage = error.message;
+                    if (userFriendlyMessage.includes("Failed to fetch")) {
+                        userFriendlyMessage = "Ошибка отправки в сеть. Возможно, ваш браузер или AdBlock блокирует PUT-запросы к GitHub. Проверьте VPN и блокировщики.";
+                    }
+                    showToast(userFriendlyMessage, "error");
                 } finally {
                     setIsCommitPending(false);
                 }
             };
 
             const triggerAutoCommitIfEnabled = (updatedDict) => {
-                if (autoCommit && ghToken && ghOwner && ghRepo) {
+                if (autoCommit && ghToken.trim() && ghOwner.trim() && ghRepo.trim()) {
                     handlePushToGitHub(updatedDict);
                 }
             };
@@ -687,7 +720,7 @@
                 return { total, candidatesCount, selectedCount, duplicateCount, uniqueRatio, uniqueCount };
             }, [dictionary, candidates]);
 
-            const isGhConfigured = ghToken && ghOwner && ghRepo;
+            const isGhConfigured = ghToken.trim() && ghOwner.trim() && ghRepo.trim();
 
             return (
                 <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-indigo-500/30 selection:text-indigo-200">
@@ -790,7 +823,7 @@
 
                                         <div className="grid grid-cols-2 gap-3">
                                             <div>
-                                                <label className="block text-xs text-zinc-400 mb-1 font-medium">Владелец репозитория</label>
+                                                <label className="block text-xs text-zinc-400 mb-1 font-medium">Владелец (Owner)</label>
                                                 <input
                                                     type="text"
                                                     placeholder="Имя на GitHub"
@@ -800,7 +833,7 @@
                                                 />
                                             </div>
                                             <div>
-                                                <label className="block text-xs text-zinc-400 mb-1 font-medium">Репозиторий</label>
+                                                <label className="block text-xs text-zinc-400 mb-1 font-medium">Репозиторий (Repo)</label>
                                                 <input
                                                     type="text"
                                                     placeholder="my-dictionary-repo"
@@ -818,7 +851,7 @@
                                             <div>
                                                 <label className="block text-xs text-zinc-400 mb-1 font-medium flex items-center space-x-1">
                                                     <GitBranch className="w-3 h-3" />
-                                                    <span>Ветка</span>
+                                                    <span>Ветка (Branch)</span>
                                                 </label>
                                                 <input
                                                     type="text"
@@ -835,6 +868,7 @@
                                                 <input
                                                     type="text"
                                                     value={ghPath}
+                                                    placeholder="russian_words_nouns.txt"
                                                     onChange={(e) => setGhPath(e.target.value)}
                                                     className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500 font-mono"
                                                 />
@@ -845,7 +879,7 @@
                                         <div className="p-3 bg-zinc-950 border border-zinc-800 rounded-xl flex items-center justify-between">
                                             <div>
                                                 <span className="block text-xs font-semibold text-zinc-300">Авто-коммит изменений</span>
-                                                <span className="block text-[10px] text-zinc-500">Автоматически отправлять в GitHub при редактировании базы.</span>
+                                                <span className="block text-[10px] text-zinc-500">Автоматически отправлять в GitHub при изменении слов.</span>
                                             </div>
                                             <label className="relative inline-flex items-center cursor-pointer">
                                                 <input 
@@ -864,13 +898,13 @@
                                 <div className="pt-2 border-t border-zinc-800/60 flex flex-col sm:flex-row items-center justify-between gap-3">
                                     <span className="text-[10px] text-zinc-500 flex items-center space-x-1">
                                         <CloudLightning className="w-3 h-3 text-indigo-400" />
-                                        <span>Изменения автоматически сохраняются и сортируются по русскому алфавиту.</span>
+                                        <span>Слова при импорте автоматически сортируются по русскому алфавиту.</span>
                                     </span>
 
                                     <div className="flex items-center space-x-2 w-full sm:w-auto">
                                         <button
                                             onClick={() => handlePullFromGitHub(false)}
-                                            disabled={!isGhConfigured || ghStatus === 'loading'}
+                                            disabled={ghStatus === 'loading'}
                                             className="flex-1 sm:flex-initial flex items-center justify-center space-x-1.5 px-4 py-2 bg-zinc-950 hover:bg-zinc-800 text-zinc-300 border border-zinc-800 rounded-xl text-xs font-medium transition-all"
                                         >
                                             <RefreshCw className={`w-3.5 h-3.5 ${ghStatus === 'loading' ? 'animate-spin' : ''}`} />
@@ -878,7 +912,7 @@
                                         </button>
                                         <button
                                             onClick={() => handlePushToGitHub()}
-                                            disabled={!isGhConfigured || isCommitPending}
+                                            disabled={isCommitPending}
                                             className="flex-1 sm:flex-initial flex items-center justify-center space-x-1.5 px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-950/50 transition-all"
                                         >
                                             {isCommitPending ? (
