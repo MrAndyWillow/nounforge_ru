@@ -186,6 +186,9 @@
             const [showGhConfig, setShowGhConfig] = useState(false);
             const [isCommitPending, setIsCommitPending] = useState(false);
 
+            // Настройки Gemini (Для внешнего хостинга на GitHub Pages)
+            const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('nf_gemini_key') || '');
+
             // ПРЕДОХРАНИТЕЛИ: Важные состояния для защиты от затирания файлов
             const [isSyncedWithGitHub, setIsSyncedWithGitHub] = useState(false);
             const [githubWordsCount, setGithubWordsCount] = useState(null);
@@ -205,7 +208,8 @@
                 localStorage.setItem('nf_gh_path', ghPath);
                 localStorage.setItem('nf_gh_sha', ghSha);
                 localStorage.setItem('nf_gh_autocommit', autoCommit.toString());
-            }, [ghToken, ghOwner, ghRepo, ghBranch, ghPath, ghSha, autoCommit]);
+                localStorage.setItem('nf_gemini_key', geminiKey);
+            }, [ghToken, ghOwner, ghRepo, ghBranch, ghPath, ghSha, autoCommit, geminiKey]);
 
             // Автоматический pull из GitHub при старте приложения, если есть настройки и запуск не из локального файла
             useEffect(() => {
@@ -443,7 +447,7 @@
 
             // --- ЭКСПОНЕНЦИАЛЬНЫЙ БЭК-ОФФ ДЛЯ GEMINI ---
             const extractNounsWithGemini = async (text, retries = 5, delay = 1000) => {
-                const apiKey = ""; 
+                const apiKey = geminiKey.trim() || ""; // Используем ключ пользователя
                 const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
                 
                 const systemPrompt = `Ты — профессиональный лингвистический экстрактор и лемматизатор русского языка. Твоя задача — проанализировать предоставленный русский текст и извлечь из него ВСЕ имена существительные. 
@@ -500,6 +504,9 @@
                         }
                         throw new Error("Не удалось разобрать структуру ответа Gemini");
                     } catch (error) {
+                        if (error.message.includes("403") || error.message.includes("400")) {
+                            throw new Error("Код 403. Отсутствует API-ключ Gemini. Укажите его в настройках (Связь с GitHub).");
+                        }
                         if (attempt === retries) {
                             throw error;
                         }
@@ -523,8 +530,22 @@
                     if (processingMode === 'ai') {
                         extractedWords = await extractNounsWithGemini(inputText);
                     } else {
-                        const rawWords = inputText.match(/[а-яА-ЯёЁ\-]+/g) || [];
-                        extractedWords = [...new Set(rawWords.map(w => w.toLowerCase()))];
+                        // Жесткий локальный фильтр от мусора (исключает слова с дефисами и частые окончания прилагательных/глаголов)
+                        const rawWords = inputText.match(/[а-яА-ЯёЁ]+/g) || []; // Исключили дефис из регулярки
+                        const stopWords = new Set(["я", "ты", "он", "она", "оно", "мы", "вы", "они", "меня", "тебя", "себя", "его", "ее", "их", "нам", "вам", "им", "мной", "тобой", "собой", "мой", "твой", "свой", "наш", "ваш", "этот", "тот", "такой", "какой", "чей", "кто", "что", "весь", "всякий", "сам", "самый", "как", "так", "где", "там", "тут", "здесь", "куда", "туда", "откуда", "оттуда", "когда", "тогда", "почему", "потому", "зачем", "затем", "в", "на", "с", "к", "по", "из", "у", "от", "для", "за", "над", "под", "до", "при", "об", "про", "о", "без", "ради", "через", "между", "перед", "около", "возле", "вдоль", "вместо", "внутри", "вне", "кроме", "сквозь", "среди", "и", "а", "но", "да", "или", "либо", "ни", "тоже", "также", "чтобы", "чтоб", "если", "хотя", "хоть", "пусть", "раз", "ведь", "даже", "уже", "ли", "ль", "же", "ж", "бы", "б", "только", "лишь", "вот", "вон", "ну", "не", "нет"]);
+                        const safeNouns = ["гений", "санаторий", "пролетарий", "сценарий", "комментарий", "алюминий", "жребий", "рабочий", "ученый", "мороженое", "животное", "запятая", "кино", "пальто", "кофе", "меню", "такси", "жюри", "радио", "шоссе", "сало", "дело", "тело", "лето", "чудо", "дно", "вино", "окно", "пятно", "зерно", "яблоко", "облако", "колесо", "солнце", "лицо", "сердце", "яйцо", "кольцо", "число", "письмо", "весло", "стекло", "кресло", "время", "бремя", "племя", "имя", "пламя", "знамя"];
+
+                        extractedWords = [...new Set(rawWords.map(w => w.toLowerCase()))].filter(w => {
+                            if (w.length < 2) return false;
+                            if (stopWords.has(w)) return false;
+                            if (safeNouns.includes(w)) return true;
+
+                            // Эвристика отсева прилагательных, причастий и глаголов
+                            const isAdjective = /(ая|яя|ое|ее|ый|ий|ой|ые|ие|ого|его|ому|ему|ым|им|ую|юю|ою|ею|вши|вший|вшая|вшее|вшие)$/.test(w);
+                            const isVerb = /(ть|ти|чь|л|ла|ло|ли|ешь|ет|ем|ете|ут|ют|ишь|ит|им|ите|ат|ят|ся|сь|в|вши|вше|учи|ючи)$/.test(w);
+                            
+                            return !isAdjective && !isVerb;
+                        });
                     }
 
                     if (extractedWords.length === 0) {
@@ -884,8 +905,25 @@
                                     <div className="space-y-4">
                                         <div>
                                             <label className="block text-xs text-zinc-400 mb-1 font-medium flex items-center space-x-1.5">
+                                                <Key className="w-3 h-3 text-emerald-400" />
+                                                <span>API-ключ Gemini (Для режима AI)</span>
+                                            </label>
+                                            <input
+                                                type="password"
+                                                placeholder="AIzaSy..."
+                                                value={geminiKey}
+                                                onChange={(e) => setGeminiKey(e.target.value)}
+                                                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 font-mono text-emerald-300"
+                                            />
+                                            <p className="text-[10px] text-zinc-500 mt-1">
+                                                Необходим при хостинге на GitHub Pages. Получить бесплатно можно в <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-indigo-400 hover:underline">Google AI Studio</a>.
+                                            </p>
+                                        </div>
+
+                                        <div className="pt-2 border-t border-zinc-800">
+                                            <label className="block text-xs text-zinc-400 mb-1 font-medium flex items-center space-x-1.5">
                                                 <Key className="w-3 h-3 text-indigo-400" />
-                                                <span>Personal Access Token (PAT)</span>
+                                                <span>Personal Access Token GitHub (PAT)</span>
                                             </label>
                                             <input
                                                 type="password"
