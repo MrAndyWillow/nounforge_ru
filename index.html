@@ -186,6 +186,11 @@
             const [showGhConfig, setShowGhConfig] = useState(false);
             const [isCommitPending, setIsCommitPending] = useState(false);
 
+            // ПРЕДОХРАНИТЕЛИ: Важные состояния для защиты от затирания файлов
+            const [isSyncedWithGitHub, setIsSyncedWithGitHub] = useState(false);
+            const [githubWordsCount, setGithubWordsCount] = useState(null);
+            const [showOverWriteModal, setShowOverOverWriteModal] = useState(false);
+
             // Сохранение словаря в localStorage при изменении
             useEffect(() => {
                 localStorage.setItem('nounforge_dictionary', JSON.stringify(dictionary));
@@ -211,14 +216,13 @@
 
             const showToast = (message, type = 'success') => {
                 setToast({ message, type });
-                setTimeout(() => setToast(null), 7000); // Увеличенный лимит отображения ошибок для удобства чтения
+                setTimeout(() => setToast(null), 8000); // Увеличенный лимит отображения ошибок для удобства чтения
             };
 
             // --- ФУНКЦИИ GITHUB REST API (С автоматической CORS-очисткой данных) ---
 
             // Загрузка словаря из GitHub
             const handlePullFromGitHub = async (quiet = false) => {
-                // Триммим и санируем все входящие строки от случайных пробелов и префиксов
                 const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
                 const repo = ghRepo.trim();
@@ -231,75 +235,94 @@
                 }
 
                 if (isLocalFile) {
-                    showToast("Не удалось выполнить запрос: браузер блокирует исходящие API-запросы с локальных файлов (file://). Пожалуйста, опубликуйте проект на GitHub Pages или запустите локальный сервер.", "error");
+                    showToast("Не удалось выполнить запрос: браузер блокирует запросы с локальных файлов.", "error");
                     return;
                 }
 
                 setGhStatus('loading');
                 
-                // Используем кэш-бастинг через GET параметр, убрав Cache-Control заголовок во избежание OPTIONS CORS-блокировок
-                const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}&_t=${Date.now()}`;
+                // 1. Метаданные получаем через стандартный API (для SHA и размера)
+                const metaUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}&_t=${Date.now()}`;
+                // 2. САМЫЙ ВАЖНЫЙ ШАГ: Само содержимое качаем через RAW API. Оно обходит лимит в 1 МБ и скачивает файлы любого размера без сбоев!
+                const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}?_t=${Date.now()}`;
 
                 try {
-                    const response = await fetch(url, {
+                    // Запрос метаданных
+                    const metaResponse = await fetch(metaUrl, {
                         method: 'GET',
                         headers: {
-                            'Authorization': `token ${token}`, // Префикс classic-токенов 'token'
+                            'Authorization': `token ${token}`,
                             'Accept': 'application/vnd.github.v3+json'
                         }
                     });
 
-                    if (response.status === 404) {
+                    if (metaResponse.status === 404) {
                         setGhStatus('connected');
                         setGhSha('');
-                        if (!quiet) showToast("Файл еще не создан в вашем репозитории на GitHub. Он создастся автоматически при первом коммите.", "info");
+                        setGithubWordsCount(0);
+                        setIsSyncedWithGitHub(true); // Новый файл/репо считается синхронизированным
+                        if (!quiet) showToast("Файл еще не создан в вашем репозитории на GitHub. Синхронизация установлена.", "info");
                         return;
                     }
 
-                    if (!response.ok) {
-                        if (response.status === 401) {
-                            throw new Error("Неверный токен доступа (401 Unauthorized). Убедитесь, что токен скопирован верно и имеет права 'repo'.");
-                        } else if (response.status === 403) {
-                            throw new Error("Доступ заблокирован (403 Forbidden). Возможно, превышен лимит запросов или токен отозван.");
-                        } else if (response.status === 404) {
-                            throw new Error("Репозиторий не найден (404). Проверьте правильность написания имени владельца и названия репозитория.");
-                        } else {
-                            throw new Error(`Код ошибки сервера: ${response.status}`);
-                        }
+                    if (!metaResponse.ok) {
+                        if (metaResponse.status === 401) throw new Error("Неверный токен доступа (401 Unauthorized). Проверьте токен.");
+                        if (metaResponse.status === 404) throw new Error("Репозиторий или файл не найдены (404).");
+                        throw new Error(`Ошибка метаданных API: ${metaResponse.status}`);
                     }
 
-                    const data = await response.json();
-                    const decodedContent = decodeBase64UTF8(data.content);
+                    const metaData = await metaResponse.json();
+                    const currentSha = metaData.sha;
+                    setGhSha(currentSha);
+
+                    // Запрос plain text содержимого через RAW
+                    const rawResponse = await fetch(rawUrl, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `token ${token}`
+                        }
+                    });
+
+                    if (!rawResponse.ok) {
+                        throw new Error(`Ошибка загрузки содержимого Raw-файла: ${rawResponse.status}`);
+                    }
+
+                    const decodedContent = await rawResponse.text();
                     
                     const words = decodedContent
                         .split(/[\r\n]+/)
                         .map(w => w.trim().toLowerCase())
                         .filter(w => w && /^[а-яё\-]+$/.test(w));
 
-                    setGhSha(data.sha);
+                    setGithubWordsCount(words.length);
+                    setIsSyncedWithGitHub(true); // СНЯТ ПРЕДОХРАНИТЕЛЬ: Теперь база актуальна!
                     setGhStatus('connected');
 
                     setDictionary(prev => {
-                        const merged = [...new Set([...prev, ...words])].sort((a, b) => a.localeCompare(b, 'ru'));
+                        // Если локально открыт дефолтный список (30 слов), полностью стираем его и ставим серверный (100к+ слов)
+                        const isDemoOnly = prev.every(w => INITIAL_DEMO_NOUNS.includes(w)) && prev.length <= INITIAL_DEMO_NOUNS.length;
+                        const baseList = isDemoOnly ? [] : prev;
+                        const merged = [...new Set([...baseList, ...words])].sort((a, b) => a.localeCompare(b, 'ru'));
                         return merged;
                     });
 
-                    if (!quiet) showToast(`Успешно загружено и объединено слов с GitHub: ${words.length}`, "success");
+                    if (!quiet) showToast(`Успешно загружено и синхронизировано слов с GitHub: ${words.length}`, "success");
                 } catch (error) {
                     console.error("GitHub Pull Error:", error);
                     setGhStatus('error');
+                    setIsSyncedWithGitHub(false); // Запрещаем автокоммиты до успешного Pull
                     if (!quiet) {
                         let userFriendlyMessage = error.message;
                         if (userFriendlyMessage.includes("Failed to fetch")) {
-                            userFriendlyMessage = "Сетевая ошибка (Failed to fetch). Возможные причины: 1) У вас включен агрессивный AdBlock/Brave Shields, блокирующий запросы к api.github.com; 2) Работает некорректно настроенный VPN; 3) Ошибка в имени владельца или репозитория.";
+                            userFriendlyMessage = "Ошибка CORS/Сети (Failed to fetch). Возможно, запросы блокируются вашим VPN, AdBlock или Brave Shield.";
                         }
                         showToast(userFriendlyMessage, "error");
                     }
                 }
             };
 
-            // Коммит и пуш словаря в GitHub
-            const handlePushToGitHub = async (forcedDictionary = null) => {
+            // Коммит и пуш словаря в GitHub (с защитой от затирания)
+            const handlePushToGitHub = async (forcedDictionary = null, isForcedOverride = false) => {
                 const dictToSave = forcedDictionary || dictionary;
                 const token = ghToken.trim().replace(/^(token|bearer)\s+/i, '');
                 const owner = ghOwner.trim();
@@ -313,7 +336,19 @@
                 }
 
                 if (isLocalFile) {
-                    showToast("Запись невозможна: браузер блокирует отправку данных на сторонние сервера при просмотре локального HTML-файла (file://). Используйте GitHub Pages.", "error");
+                    showToast("Запись заблокирована: file:// протокол не поддерживает сетевые запросы API.", "error");
+                    return;
+                }
+
+                // ПРЕДОХРАНИТЕЛЬ 1: Защита от случайного Push, если еще ни разу не делали Pull
+                if (!isSyncedWithGitHub && !isForcedOverride && ghSha) {
+                    setShowOverOverWriteModal(true);
+                    return;
+                }
+
+                // ПРЕДОХРАНИТЕЛЬ 2: Защита от затирания большого объема маленьким объемом локальных данных
+                if (githubWordsCount !== null && githubWordsCount > dictToSave.length + 50 && !isForcedOverride) {
+                    setShowOverOverWriteModal(true);
                     return;
                 }
 
@@ -328,7 +363,7 @@
                 try {
                     let currentSha = ghSha;
                     
-                    // Запрашиваем актуальный SHA перед отправкой коммита (избегаем рассинхронизаций 409 Conflict)
+                    // Запрашиваем свежий SHA
                     const getResponse = await fetch(`${url}?ref=${branch}&_t=${Date.now()}`, {
                         method: 'GET',
                         headers: {
@@ -370,14 +405,16 @@
 
                     const putData = await putResponse.json();
                     setGhSha(putData.content.sha);
+                    setGithubWordsCount(sortedDict.length);
+                    setIsSyncedWithGitHub(true); // Уверенная синхронизация
                     setGhStatus('connected');
-                    showToast("Изменения успешно сохранены и закомичены в ваш репозиторий GitHub!", "success");
+                    showToast("Изменения успешно закомичены в ваш репозиторий GitHub!", "success");
                 } catch (error) {
                     console.error("GitHub Push Error:", error);
                     setGhStatus('error');
                     let userFriendlyMessage = error.message;
                     if (userFriendlyMessage.includes("Failed to fetch")) {
-                        userFriendlyMessage = "Ошибка сети при коммите. Браузер или брандмауэр прервал PUT-запрос к API GitHub. Пожалуйста, отключите блокировщики рекламы или VPN.";
+                        userFriendlyMessage = "Ошибка отправки коммита. Отключите VPN/AdBlock, блокирующие PUT запросы к GitHub.";
                     }
                     showToast(userFriendlyMessage, "error");
                 } finally {
@@ -385,8 +422,14 @@
                 }
             };
 
+            // Триггер автокоммита (Проводит проверку на синхронизацию с репозиторием)
             const triggerAutoCommitIfEnabled = (updatedDict) => {
                 if (autoCommit && ghToken.trim() && ghOwner.trim() && ghRepo.trim()) {
+                    if (!isSyncedWithGitHub) {
+                        console.warn("Авто-коммит приостановлен: локальная база не синхронизирована с сервером.");
+                        showToast("Авто-коммит заблокирован: сначала выполните Pull, чтобы не стереть удаленные данные!", "warning");
+                        return;
+                    }
                     handlePushToGitHub(updatedDict);
                 }
             };
@@ -771,16 +814,18 @@
                                 {/* Статус GitHub */}
                                 {isGhConfigured && (
                                     <div className="hidden md:flex items-center space-x-1.5 px-2.5 py-2 bg-zinc-900 border border-zinc-800 rounded-xl text-xs">
-                                        <span className={`w-2 h-2 rounded-full ${
-                                            ghStatus === 'connected' ? 'bg-emerald-500' :
+                                        <span className={`w-2.5 h-2.5 rounded-full ${
+                                            ghStatus === 'connected' && isSyncedWithGitHub ? 'bg-emerald-500' :
+                                            ghStatus === 'connected' && !isSyncedWithGitHub ? 'bg-yellow-500 animate-pulse' :
                                             ghStatus === 'loading' || ghStatus === 'syncing' ? 'bg-amber-500 animate-pulse' :
                                             ghStatus === 'error' ? 'bg-red-500' : 'bg-zinc-600'
                                         }`} />
                                         <span className="text-zinc-400">
-                                            {ghStatus === 'connected' ? 'Синхронизирован' :
-                                            ghStatus === 'loading' ? 'Чтение...' :
-                                            ghStatus === 'syncing' ? 'Коммит...' :
-                                            ghStatus === 'error' ? 'Ошибка связи' : 'Не подключен'}
+                                            {ghStatus === 'connected' && isSyncedWithGitHub ? `Синхронизирован (${githubWordsCount || 0} слов)` :
+                                             ghStatus === 'connected' && !isSyncedWithGitHub ? 'Требуется Pull!' :
+                                             ghStatus === 'loading' ? 'Скачивание...' :
+                                             ghStatus === 'syncing' ? 'Коммит...' :
+                                             ghStatus === 'error' ? 'Ошибка связи' : 'Не подключен'}
                                         </span>
                                     </div>
                                 )}
@@ -957,6 +1002,18 @@
                     {/* --- Главная рабочая область --- */}
                     <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
                         
+                        {/* Предупреждение о необходимости выполнить Pull при входе */}
+                        {isGhConfigured && !isSyncedWithGitHub && (
+                            <div className="p-4 bg-amber-950/40 border border-amber-900/50 rounded-2xl flex items-start space-x-3 animate-pulse">
+                                <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+                                <div className="text-xs text-amber-200 leading-relaxed">
+                                    <strong className="block font-semibold text-amber-300 mb-0.5">⚠️ Внимание: Требуется синхронизация репозитория</strong>
+                                    Вы настроили связь с репозиторием GitHub, но локальная копия приложения еще не синхронизирована с файлом на сервере. Во избежание случайного затирания удаленных данных, 
+                                    пожалуйста, нажмите кнопку <button onClick={() => handlePullFromGitHub(false)} className="underline hover:text-white font-bold">Загрузить (Pull)</button> перед началом любой работы.
+                                </div>
+                            </div>
+                        )}
+
                         {/* --- Секция информационных панелей / Статистики --- */}
                         <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                             <div className="bg-zinc-900/60 border border-zinc-800/80 p-5 rounded-2xl relative overflow-hidden group hover:border-zinc-700/80 transition-all duration-300">
@@ -1424,7 +1481,7 @@
                                                             className={`w-9 h-9 text-xs font-semibold rounded-xl border transition-all ${
                                                                 currentPage === pageNumber
                                                                     ? 'bg-indigo-600 border-indigo-500 text-white shadow'
-                                                                    : 'bg-zinc-950 border-zinc-850 text-zinc-400 hover:bg-zinc-850 hover:text-zinc-200'
+                                                                    : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:bg-zinc-850 hover:text-zinc-200'
                                                             }`}
                                                         >
                                                             {pageNumber}
@@ -1465,6 +1522,59 @@
                         </footer>
 
                     </main>
+
+                    {/* --- ПРЕДОХРАНИТЕЛЬНЫЙ МОДАЛЬНЫЙ ДИАЛОГ (ЗАЩИТА ОТ ЗАТИРАНИЯ ФАЙЛОВ) --- */}
+                    {showOverWriteModal && (
+                        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+                            <div className="bg-zinc-900 border border-zinc-800 max-w-md w-full rounded-2xl p-6 shadow-2xl space-y-4">
+                                <div className="flex items-center space-x-3 text-amber-500">
+                                    <AlertCircle className="w-8 h-8 flex-shrink-0 animate-bounce-short" />
+                                    <h3 className="text-lg font-bold text-zinc-100">Внимание: Опасность перезаписи!</h3>
+                                </div>
+                                
+                                <p className="text-xs text-zinc-400 leading-relaxed">
+                                    Вы собираетесь закоммитить на GitHub локальную базу, содержащую <strong className="text-zinc-200">{dictionary.length}</strong> слов. 
+                                    При этом на сервере GitHub сейчас находится файл, содержащий примерно <strong className="text-amber-400">{githubWordsCount || '101k+'}</strong> слов.
+                                </p>
+                                
+                                <p className="text-xs text-red-400 leading-relaxed bg-red-950/20 p-3 border border-red-900/30 rounded-xl">
+                                    <strong>Внимание!</strong> Принудительная отправка полностью удалит все 101k+ слов на сервере и заменит их вашими локальными данными. Вы потеряете историю!
+                                </p>
+
+                                <div className="space-y-2 pt-2">
+                                    <button
+                                        onClick={async () => {
+                                            setShowOverOverWriteModal(false);
+                                            await handlePullFromGitHub(false);
+                                        }}
+                                        className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-all shadow"
+                                    >
+                                        Сначала выполнить Pull (Рекомендуется)
+                                    </button>
+                                    
+                                    <div className="flex space-x-2">
+                                        <button
+                                            onClick={() => {
+                                                setShowOverOverWriteModal(false);
+                                            }}
+                                            className="flex-1 py-2 px-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-semibold transition-all"
+                                        >
+                                            Отмена
+                                        </button>
+                                        <button
+                                            onClick={async () => {
+                                                setShowOverOverWriteModal(false);
+                                                await handlePushToGitHub(null, true); // Игнорируем предохранитель
+                                            }}
+                                            className="flex-1 py-2 px-3 bg-red-950/40 hover:bg-red-900/50 text-red-200 border border-red-900/40 rounded-xl text-xs font-semibold transition-all"
+                                        >
+                                            Все равно записать (Force Push)
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {/* --- Глобальное всплывающее уведомление (Toast) --- */}
                     {toast && (
